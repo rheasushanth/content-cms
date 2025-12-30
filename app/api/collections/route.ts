@@ -1,23 +1,78 @@
 import { NextResponse, NextRequest } from 'next/server'
 import { createClient } from '@/lib/auth/supabase'
+import { createHash } from 'crypto'
+
+// Helper function to verify API key
+async function verifyApiKey(apiKey: string, requiredScope: string) {
+  const supabase = await createClient()
+  
+  // Hash the API key to compare with database
+  const hashedKey = createHash('sha256').update(apiKey).digest('hex')
+  
+  const { data, error } = await supabase
+    .from('api_keys')
+    .select('owner, scopes, active, expires_at')
+    .eq('key_hash', hashedKey)
+    .single()
+  
+  if (error || !data || !data.active) {
+    return null
+  }
+
+  // Check if expired
+  if (data.expires_at && new Date(data.expires_at) < new Date()) {
+    return null
+  }
+
+  // Check if has required scope
+  const scopes = data.scopes as any[]
+  const hasScope = scopes.some(scope => 
+    typeof scope === 'string' ? scope === requiredScope : scope === requiredScope
+  )
+  
+  if (!hasScope) {
+    return null
+  }
+  
+  return { userId: data.owner }
+}
 
 // GET all collections (protected)
 export async function GET(request: NextRequest) {
   try {
     const supabase = await createClient()
-    const { data: { user }, error: authError } = await supabase.auth.getUser()
-
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    let userId: string | null = null
+    
+    // Check for API key authentication first
+    const authHeader = request.headers.get('authorization')
+    if (authHeader?.startsWith('Bearer ')) {
+      const apiKey = authHeader.substring(7)
+      const apiKeyData = await verifyApiKey(apiKey, 'read:collections')
+      
+      if (!apiKeyData) {
+        return NextResponse.json({ error: 'Invalid or expired API key' }, { status: 401 })
+      }
+      
+      userId = apiKeyData.userId
+    } else {
+      // Fall back to session authentication
+      const { data: { user }, error: authError } = await supabase.auth.getUser()
+      
+      if (authError || !user) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+      
+      userId = user.id
     }
 
+    // Fetch collections for the authenticated user
     const { data, error } = await supabase
       .from('collections')
       .select(`
         *,
         schema:schemas(*)
       `)
-      .eq('owner', user.id)
+      .eq('owner', userId)
       .order('created_at', { ascending: false })
 
     if (error) throw error
@@ -31,33 +86,61 @@ export async function GET(request: NextRequest) {
 // POST create new collection (protected)
 export async function POST(request: NextRequest) {
   try {
-    // Auth check
     const supabase = await createClient()
-    const { data: { user }, error: authError } = await supabase.auth.getUser()
-
-    if (authError || !user) {
-      console.log('❌ Auth failed')
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    let userId: string | null = null
+    
+    // Check for API key authentication first
+    const authHeader = request.headers.get('authorization')
+    if (authHeader?.startsWith('Bearer ')) {
+      const apiKey = authHeader.substring(7)
+      const apiKeyData = await verifyApiKey(apiKey, 'write:collections')
+      
+      if (!apiKeyData) {
+        return NextResponse.json({ error: 'Invalid or expired API key, or insufficient permissions' }, { status: 401 })
+      }
+      
+      userId = apiKeyData.userId
+      console.log('✅ API Key authenticated:', userId)
+    } else {
+      // Fall back to session authentication
+      const { data: { user }, error: authError } = await supabase.auth.getUser()
+      
+      if (authError || !user) {
+        console.log('❌ Auth failed')
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+      
+      userId = user.id
+      console.log('✅ User authenticated:', userId)
     }
-
-    console.log('✅ User authenticated:', user.id)
 
     // Get user's profile
     let { data: profile, error: profileError } = await supabase
       .from('profiles')
       .select('id')
-      .eq('id', user.id)
+      .eq('id', userId)
       .single()
 
     // If profile doesn't exist, create it
     if (profileError || !profile) {
       console.log('⚠️ Profile not found, creating one...')
+      
+      // Get user email if using session auth
+      let userEmail = ''
+      let userName = 'User'
+      
+      if (!authHeader) {
+        const { data: { user } } = await supabase.auth.getUser()
+        userEmail = user?.email || ''
+        userName = user?.user_metadata?.name || user?.email?.split('@')[0] || 'User'
+      }
+      
       const { data: newProfile, error: createError } = await supabase
         .from('profiles')
         .insert([{
-          id: user.id,
-          email: user.email || '',
-          name: user.user_metadata?.name || user.email?.split('@')[0] || 'User',
+          id: userId,
+          email: userEmail,
+          name: userName,
           role: 'user'
         }])
         .select('id')
@@ -94,15 +177,14 @@ export async function POST(request: NextRequest) {
 
     console.log('✅ Validation passed')
 
-    // Insert collection - collections table stores instances of schemas
-    // The name/description come from the schema, not the collection itself
+    // Insert collection
     const { data, error } = await supabase
       .from('collections')
       .insert([{
         schema_id: schema_id,
         owner: profile.id,
-        data: {},  // Empty data object for new collection
-        published: false  // Default to unpublished
+        data: {},
+        published: false
       }])
       .select()
       .single()
